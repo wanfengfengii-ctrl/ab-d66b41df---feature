@@ -77,3 +77,61 @@ def make_records_from_sim(times, ambients, lid, t0_box, tau_closed, tau_open):
             }
         )
     return raw
+
+
+def box_closed_form_segment(records, i, tau_closed, tau_open):
+    """返回第 i 段箱温闭式解 T_box(s)（s 距段起点），与生产引擎完全同构。"""
+    import math as _m
+
+    r0, r1 = records[i], records[i + 1]
+    dur = float(r1["time"]) - float(r0["time"])
+    a = float(r0["ambient_temp"])
+    b = (float(r1["ambient_temp"]) - a) / dur
+    tau = float(tau_open if r0["lid_open"] else tau_closed)
+    t_i = float(r0["box_temp"])
+
+    def box(s):
+        return a + b * (s - tau) + (t_i - a + b * tau) * _m.exp(-s / tau)
+
+    return box, dur
+
+
+def rk4_core_simulate(records, tau_closed, tau_open, tau_sample, core_initial, dt=0.25):
+    """独立 RK4 积分样品核心温度 dC/dt=(T_box(t)-C)/tau_sample。
+
+    驱动 T_box 取生产箱温求解的逐段闭式连续曲线（每段以该段实测箱温锚定，
+    与生产 audit 的箱体口径一致）；核心温度 C 跨记录连续，仅以 core_initial
+    在首条记录锚定一次。用于交叉核验闭式核心求解，不参与生产裁决。
+    返回逐 dt 的 (t, C, T_box)。
+    """
+
+    def rk4_core(C, t, h, box_fn, tau_s):
+        def f(tt, cc):
+            return (box_fn(tt) - cc) / tau_s
+
+        k1 = f(t, C)
+        k2 = f(t + h / 2, C + h * k1 / 2)
+        k3 = f(t + h / 2, C + h * k2 / 2)
+        k4 = f(t + h, C + h * k3)
+        return C + h * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+
+    out = []
+    C = float(core_initial)
+    t = float(records[0]["time"])
+    box0, _ = box_closed_form_segment(records, 0, tau_closed, tau_open)
+    out.append((t, C, box0(0.0)))
+    for i in range(len(records) - 1):
+        box, dur = box_closed_form_segment(records, i, tau_closed, tau_open)
+        seg_t0 = float(records[i]["time"])
+        n = int(math.floor(dur / dt))
+        for k in range(n):
+            h = min(dt, dur - k * dt)
+            C = rk4_core(C, t, h, lambda tt, _s0=seg_t0, _bf=box: _bf(tt - _s0), tau_sample)
+            t += h
+            out.append((t, C, box(t - seg_t0)))
+        if t < float(records[i + 1]["time"]) - 1e-9:
+            h = float(records[i + 1]["time"]) - t
+            C = rk4_core(C, t, h, lambda tt, _s0=seg_t0, _bf=box: _bf(tt - _s0), tau_sample)
+            t = float(records[i + 1]["time"])
+            out.append((t, C, box(dur)))
+    return out

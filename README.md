@@ -12,6 +12,12 @@
 提交后前端展示：**放行 / 拒收 / 数据不合法**结论、箱温连续曲线、各段解析极值、
 累计连续超温区间，以及**最早使油样失效的时刻**。
 
+质控员还可在审计页启用 **核心温度复核**：箱体探头合格并不代表油样内部已同步
+降温。填写**首条记录时的样品温度、样品对箱温的热惯性、核心温度上限**后，
+服务端以上述逐段闭式箱温曲线为**连续驱动**，再做一次样品一阶响应求解，
+跨记录传递核心温度，返回核心段内极值、阈值穿越与**首个超限（最早风险）时刻**。
+未启用时原请求、结论与证据完全保持不变。
+
 ---
 
 ## 1. 数学模型与裁决口径
@@ -43,6 +49,29 @@ T'(s) = b − (T_i − a + b·τ)/τ · exp(−s/τ)
 
 > 生产裁决路径不含任何数值积分；仓库中的 RK4 参考实现仅用于测试交叉验证。
 
+### 核心温度复核模型（启用后）
+
+样品核心温度 `C(t)` 以同一阶响应对**连续箱温闭式曲线** `T_box(t)` 做跟随：
+
+```
+dC/dt = (T_box(t) − C(t)) / τ_sample
+```
+
+- 样品状态**仅在首条记录时刻**以 `sample_initial_temp` 锚定一次，随后每段段末
+  闭式状态直接作为下一段初值，**跨记录连续传递，绝不在每条记录处重新锚定**
+  （也不以录入的箱温读数重置样品）；
+- 段内 `T_box(s) = c0 + c1·s + c2·exp(−s/τ_box)`，代入样品方程直接积分得闭式解
+  `C(s) = c0 − c1·τs + c1·s + D·exp(−s/τ_box) + (C0 − c0 + c1·τs − D)·exp(−s/τs)`，
+  其中 `D = c2·τ_box/(τ_box − τ_sample)`；
+- **退化情形 `τ_sample == τ_box`**（样品热惯性等于箱体热惯性）取等价极限闭式解：
+  `C(s) = c0 − c1·τ + c1·s + c2·(s/τ)·exp(−s/τ) + (C0 − c0 + c1·τ)·exp(−s/τ)`；
+- 段内极值由解析驻点（`C′=0 ⇔ T_box=C`）定位：以箱温驻点切分保号区间后逐段二分，
+  可找出一段内至多两个驻点；阈值穿越在单调子区间二分求根（容差 `1e-12 s`），
+  **不按展示采样点裁决**；
+- **核心拒收口径**：严格超限 `C > core_temp_limit` 即拒收，
+  **最早风险时刻 = 首次上穿核心上限的时刻**（样品初值已超限时即首条记录时刻）。
+- 总体结论同时考虑箱体与核心：`箱体放行 + 核心超限 → 拒收（箱体放行但核心温度超限）`。
+
 ### 关键业务场景（拒收演示数据）
 
 录入读数全部低于 8℃：`4.0 / 7.81 / 7.25 / 3.21 / 3.01 ℃`，
@@ -58,9 +87,9 @@ T'(s) = b − (T_i − a + b·τ)/τ · exp(−s/τ)
 .
 ├── backend/
 │   ├── app/
-│   │   ├── thermal.py        # 一阶模型闭式求解 + 阈值穿越 + 暴露区间裁决
+│   │   ├── thermal.py        # 一阶模型闭式求解 + 阈值穿越 + 暴露区间裁决 + 核心温度复核
 │   │   └── main.py           # FastAPI：/api/audit、/api/audit/schema、/healthz
-│   ├── tests/                # pytest：引擎解析解/RK4 交叉验证 + API 测试
+│   ├── tests/                # pytest：引擎解析解/RK4 交叉验证、核心复核、API 测试
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/main.js           # 录入表单、真实 API 调用、SVG 连续曲线、证据表格
@@ -100,6 +129,24 @@ T'(s) = b − (T_i − a + b·τ)/τ · exp(−s/τ)
 
 - `time`：全表统一使用 **ISO 8601 字符串**（朴素时间按 UTC 解释，回显统一 UTC）
   或**数值纪元秒**，不得混用；必须严格递增；记录数 4–30。
+- 可选 `core_temperature_review`（**核心温度复核**）：
+
+  ```json
+  "core_temperature_review": {
+    "enabled": true,
+    "sample_initial_temp": 4.0,
+    "tau_sample_seconds": 900,
+    "core_temp_limit": 6.0
+  }
+  ```
+
+  - 缺省 / `enabled:false` / `enabled:null` 时不启用，**请求、结论与证据保持原样**；
+  - `sample_initial_temp`：首条记录时的样品温度（有限数值）；
+  - `tau_sample_seconds`：样品对箱温的热惯性（秒，`>0`，允许等于箱体热惯性，
+    服务端自动走等惯性极限闭式解）；
+  - `core_temp_limit`：核心温度上限（有限数值）；
+  - NaN / Infinity / 非数值 / 非正数均返回 `422`，错误带字段名
+    （如 `core_temperature_review.tau_sample_seconds`）。
 - 成功返回 `200`，`status` 为 `pass`（放行）或 `reject`（拒收）。
 - 数据不合法返回 `422`：`{"status":"invalid","verdict":"数据不合法","errors":[...]}`；
   非法 JSON / 非对象请求体返回 `400`。
@@ -109,6 +156,8 @@ T'(s) = b − (T_i − a + b·τ)/τ · exp(−s/τ)
 ```json
 {
   "status": "reject",
+  "box_status": "reject",
+  "verdict": "拒收",
   "exceedance_intervals": [
     {"start_time": 63.4, "end_time": 1507.3,
      "duration_seconds": 1443.9, "reaches_limit": true}
@@ -116,6 +165,31 @@ T'(s) = b − (T_i − a + b·τ)/τ · exp(−s/τ)
   "first_failure_time": {"time": 663.4, "elapsed_seconds": 663.4, "interval_index": 0},
   "segments": [{"max_temp": {...}, "min_temp": {...}, "crossings": [{"direction":"up", ...}]}],
   "curve": [ {"elapsed_seconds": ..., "box_temp": ..., "ambient_temp": ...} ]
+}
+```
+
+启用核心温度复核时额外返回 `core_temperature_review`（未启用则不出现该字段），
+顶层 `status` 为箱体与核心结论的合并，并额外提供 `box_status` 区分两者：
+
+```json
+{
+  "status": "reject",
+  "box_status": "pass",
+  "verdict": "拒收（箱体放行但核心温度超限）",
+  "core_temperature_review": {
+    "enabled": true,
+    "status": "reject",
+    "sample_initial_temp": 4.0,
+    "tau_sample_seconds": 900,
+    "core_temp_limit": 6.0,
+    "core_max_temp": 7.13,
+    "first_risk_time": {"time": 1101.1, "elapsed_seconds": 1101.1, "interval_index": 0},
+    "exceedance_intervals": [ {"start_time": 1101.1, "end_time": 2400.0, ...} ],
+    "segments": [ {"core_temp_start": ..., "core_temp_end": ...,
+                   "max_temp": {...}, "min_temp": {...}, "crossings": [...],
+                   "degenerate_equal_tau": false} ],
+    "curve": [ {"elapsed_seconds": ..., "core_temp": ..., "box_temp": ...} ]
+  }
 }
 ```
 
@@ -158,7 +232,8 @@ APP_PORT=9090 docker compose up -d --build app          # http://localhost:9090
 ### 一次性 verify 服务
 
 `verify` 服务通过 `depends_on: condition: service_healthy` **在 app 健康后才启动**，
-顺序执行 **① 后端代码测试 ② 前端生产构建 ③ 温控审计 API 冒烟**，随后**自行退出**，
+顺序执行 **① 后端代码测试 ② 前端生产构建 ③ 温控审计 API 冒烟（含核心温度复核
+启用 / 未启用两类）**，随后**自行退出**，
 以容器退出码报告结果（`0` 全部通过，非零表示失败）：
 
 ```bash
@@ -172,10 +247,12 @@ docker inspect <verify容器> --format '{{.State.ExitCode}}'
 
 ## 6. 前端页面
 
-- 左侧录入 4–30 条记录与四个模型参数，内置三套预设：
-  **拒收（读数全合格、途中升温）/ 放行 / 短时超温不足时长**；
-- 右侧展示结论徽章、最早失效时刻证据卡；
-- SVG 连续曲线图：箱温闭式曲线、环境温线性线、允许箱温阈值、
-  超温区间红色遮罩、箱盖开启时段底色、录入读数空心点、最早失效竖线；
-- 表格列出**累计连续超温区间**（起止时刻、持续时长、是否达到限额）
-  与**各段解析极值 / 阈值穿越方向与时刻**。
+- 左侧录入 4–30 条记录与四个模型参数，内置四套预设：
+  **拒收（读数全合格、途中升温）/ 放行 / 短时超温不足时长 / 箱体放行·核心拒收**；
+- 可勾选启用**核心温度复核**并填写样品初温、样品热惯性、核心温度上限；
+- 右侧展示结论徽章（区分**箱体放行但核心拒收**）、最早失效/最早风险时刻证据卡；
+- SVG 连续曲线图：箱温闭式曲线、**叠加的样品核心温度曲线**、环境温线性线、
+  允许箱温与核心温度上限阈值、箱温/核心超限区间遮罩、箱盖开启时段底色、
+  录入读数空心点、最早失效/最早风险竖线；
+- 表格列出**累计连续超温区间**、**各段解析极值 / 阈值穿越**，启用复核时
+  额外列出核心超限区间与各段核心起止状态 / 极值 / 穿越（等 τ 退化有标注）。

@@ -37,11 +37,35 @@ const PRESETS = {
     ],
     parameters: { tau_closed: 300, tau_open: 90, box_temp_limit: 8, exposure_limit_seconds: 3600 },
   },
+  core: {
+    label: "箱体放行但核心拒收：探头合格、油样未降温",
+    records: [
+      { time: 0, box_temp: 4.0, ambient_temp: 7.5, lid_open: false },
+      { time: 600, box_temp: 7.026327, ambient_temp: 7.5, lid_open: false },
+      { time: 1200, box_temp: 7.435895, ambient_temp: 7.5, lid_open: false },
+      { time: 1800, box_temp: 7.491324, ambient_temp: 7.5, lid_open: false },
+      { time: 2400, box_temp: 7.498826, ambient_temp: 7.5, lid_open: false },
+    ],
+    parameters: { tau_closed: 300, tau_open: 90, box_temp_limit: 8, exposure_limit_seconds: 600 },
+    coreReview: {
+      enabled: true,
+      sample_initial_temp: 4.0,
+      tau_sample_seconds: 900,
+      core_temp_limit: 6.0,
+    },
+  },
 };
 
 const state = {
   records: structuredClone(PRESETS.reject.records),
   parameters: { ...PRESETS.reject.parameters },
+  // 核心温度复核（可选；默认不启用，请求/结论/证据保持原样）
+  coreReview: {
+    enabled: false,
+    sample_initial_temp: 4.0,
+    tau_sample_seconds: 300,
+    core_temp_limit: 8.0,
+  },
   result: null,
   error: null,
   loading: false,
@@ -114,6 +138,23 @@ function renderForm() {
     <div class="hint">约定：相邻记录之间环境温度按<b>线性变化</b>；箱温按一阶模型
       <code>dT/dt=(T_env−T)/τ</code> 逐段闭式求解；箱盖状态在记录时刻切换 τ。</div>
 
+    <h2 style="margin-top:18px">③ 核心温度复核（可选，默认不启用）</h2>
+    <label class="field check-field">
+      <input id="core_enabled" type="checkbox" ${state.coreReview.enabled ? "checked" : ""} />
+      <span>启用“核心温度复核”：以连续箱温闭式曲线驱动样品一阶响应，跨记录传递核心温度，
+      不在每条记录处重新锚定</span>
+    </label>
+    <div class="params-grid" id="core-fields" style="${state.coreReview.enabled ? "" : "display:none"}">
+      <label class="field"><span>首条记录时的样品温度（℃）</span>
+        <input id="sample_initial_temp" type="number" step="any" value="${state.coreReview.sample_initial_temp}" /></label>
+      <label class="field"><span>样品对箱温的热惯性 τ样品（秒，&gt;0）</span>
+        <input id="tau_sample_seconds" type="number" step="any" value="${state.coreReview.tau_sample_seconds}" /></label>
+      <label class="field"><span>核心温度上限（℃）</span>
+        <input id="core_temp_limit" type="number" step="any" value="${state.coreReview.core_temp_limit}" /></label>
+    </div>
+    <div class="hint" id="core-off-hint" style="${state.coreReview.enabled ? "display:none" : ""}">
+      未启用时，原请求、结论与证据保持不变（仅做箱体探头裁决）。</div>
+
     <div class="btn-row">
       <button class="action" id="submit">提交审计</button>
       <button class="ghost" id="addRow">+ 增加记录</button>
@@ -122,6 +163,7 @@ function renderForm() {
       <button class="ghost" data-preset="reject">拒收演示数据</button>
       <button class="ghost" data-preset="pass">放行演示数据</button>
       <button class="ghost" data-preset="short">短时超温数据</button>
+      <button class="ghost" data-preset="core">箱体放行·核心拒收</button>
     </div>
     ${state.error ? `<div class="error-box">${state.error}</div>` : ""}
   </div>`;
@@ -143,22 +185,33 @@ function collectInputs() {
     box_temp_limit: Number(document.getElementById("box_temp_limit").value),
     exposure_limit_seconds: Number(document.getElementById("exposure_limit_seconds").value),
   };
-  return { recs, params };
+  const coreEnabled = document.getElementById("core_enabled").checked;
+  const coreReview = {
+    enabled: coreEnabled,
+    sample_initial_temp: Number(document.getElementById("sample_initial_temp").value),
+    tau_sample_seconds: Number(document.getElementById("tau_sample_seconds").value),
+    core_temp_limit: Number(document.getElementById("core_temp_limit").value),
+  };
+  return { recs, params, coreReview };
 }
 
 async function submitAudit() {
-  const { recs, params } = collectInputs();
+  const { recs, params, coreReview } = collectInputs();
   state.records = recs;
   state.parameters = params;
+  state.coreReview = coreReview;
   state.loading = true;
   state.error = null;
   state.result = null;
   render();
+  // 仅在启用时上送核心温度复核；未启用时请求与原先完全一致
+  const payload = { records: recs, parameters: params };
+  if (coreReview.enabled) payload.core_temperature_review = coreReview;
   try {
     const resp = await fetch("/api/audit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ records: recs, parameters: params }),
+      body: JSON.stringify(payload),
     });
     const body = await resp.json();
     if (body.status === "invalid") {
@@ -179,7 +232,7 @@ async function submitAudit() {
 /* ---------------- 结果区 ---------------- */
 
 function renderVerdict(r) {
-  if (state.loading) return `<div class="verdict"><div class="badge">…</div><div class="sub">正在连续求解各段箱温…</div></div>`;
+  if (state.loading) return `<div class="verdict"><div class="badge">…</div><div class="sub">正在连续求解各段箱温${state.coreReview.enabled ? "与样品核心温度" : ""}…</div></div>`;
   if (state.error)
     return `<div class="verdict invalid"><div class="badge">数据不合法</div>
       <div class="sub">服务端拒绝裁决，请依据右侧字段提示修正后重新提交。</div></div>`;
@@ -187,27 +240,54 @@ function renderVerdict(r) {
     return `<div class="verdict"><div class="badge" style="background:var(--panel-2);color:var(--muted)">待提交</div>
       <div class="sub">填写记录与参数后点击「提交审计」，服务端将以一阶热响应模型逐段解析求解。</div></div>`;
 
+  const cb = r.core_temperature_review;
+  // 未启用复核时响应无 box_status，箱体结论即顶层 status
+  const boxReject = (r.box_status ?? r.status) === "reject";
+
   if (r.status === "pass") {
     return `<div class="verdict pass"><div class="badge">放 行</div>
       <div class="sub">箱温连续曲线全程未形成达到 <strong>${fmtDuration(
         r.parameters.exposure_limit_seconds
       )}</strong> 的连续超温区间。<br/>
       累计超温时长 <strong>${fmtDuration(r.total_exceedance_seconds)}</strong>，
-      连续超温区间 <strong>${r.exceedance_intervals.length}</strong> 个。</div></div>`;
+      连续超温区间 <strong>${r.exceedance_intervals.length}</strong> 个。
+      ${cb ? `<br/>核心温度复核：<strong>未越限</strong>（核心最高 ${fmtTemp(cb.core_max_temp)}℃ ≤ 上限 ${fmtTemp(cb.core_temp_limit)}℃）。` : ""}</div></div>`;
   }
-  const ff = r.first_failure_time;
-  return `<div class="verdict reject"><div class="badge">拒 收</div>
-    <div class="sub">存在连续超温达到 <strong>${fmtDuration(
+
+  // 总体拒收：区分箱体拒收 / 核心拒收 / 两者
+  const badgeText = cb && !boxReject ? "核心拒收" : "拒 收";
+  const lines = [];
+  if (boxReject) {
+    const ff = r.first_failure_time;
+    lines.push(`箱体探头超限：存在连续超温达到 <strong>${fmtDuration(
       r.parameters.exposure_limit_seconds
     )}</strong> 的区间，油样自 <strong>${ff.time}</strong>
-    （距首条记录 ${fmtElapsed(ff.elapsed_seconds)}）起失效。<br/>
-    共 ${r.exceedance_intervals.length} 个连续超温区间，累计超温 ${fmtDuration(
+      （距首条记录 ${fmtElapsed(ff.elapsed_seconds)}）起失效。`);
+  } else {
+    lines.push(`箱体探头裁决：<strong>放行</strong>（箱温读数与连续曲线均未触发箱体拒收）。`);
+  }
+  if (cb) {
+    if (cb.status === "reject") {
+      const rk = cb.first_risk_time;
+      lines.push(`<strong style="color:var(--core)">核心温度超限</strong>：探头合格不代表油样内部已降温，
+        样品核心温度最早于 <strong>${rk.time}</strong>（距首条记录 ${fmtElapsed(rk.elapsed_seconds)}）
+        越过上限 ${fmtTemp(cb.core_temp_limit)}℃；核心最高 ${fmtTemp(cb.core_max_temp)}℃。`);
+    } else {
+      lines.push(`核心温度复核：<strong>未越限</strong>（核心最高 ${fmtTemp(cb.core_max_temp)}℃）。`);
+    }
+  }
+  return `<div class="verdict ${cb && !boxReject ? "core" : "reject"}">
+    <div class="badge">${badgeText}</div>
+    <div class="sub">${lines.join("<br/>")}<br/>
+    共 ${r.exceedance_intervals.length} 个箱体连续超温区间，累计箱温超温 ${fmtDuration(
     r.total_exceedance_seconds
   )}。</div></div>`;
 }
 
 function renderFailureCard(r) {
-  if (!r || r.status !== "reject") return "";
+  // 仅在箱体探头本身拒斥时展示箱温失效卡；箱体放行但核心拒收由核心卡呈现
+  const boxStatus = r.box_status ?? r.status;
+  if (!r || boxStatus !== "reject" || !r.first_failure_time) return "";
   const ff = r.first_failure_time;
   const iv = r.exceedance_intervals[ff.interval_index];
   return `<div class="failure-card">
@@ -229,8 +309,14 @@ function buildChart(r) {
   const W = 920, H = 380, ML = 56, MR = 18, MT = 18, MB = 44;
   const iw = W - ML - MR, ih = H - MT - MB;
   const curve = r.curve;
+  const cb = r.core_temperature_review;
+  const coreCurve = cb?.curve ?? null;
   const xmax = curve[curve.length - 1].elapsed_seconds;
   const allT = curve.flatMap((p) => [p.box_temp, p.ambient_temp]).concat([r.parameters.box_temp_limit]);
+  if (coreCurve) {
+    coreCurve.forEach((p) => allT.push(p.core_temp));
+    allT.push(cb.core_temp_limit);
+  }
   let ymin = Math.min(...allT), ymax = Math.max(...allT);
   const pad = Math.max(1, (ymax - ymin) * 0.08);
   ymin -= pad; ymax += pad;
@@ -252,15 +338,34 @@ function buildChart(r) {
   const path = (key) =>
     curve.map((p, i) => `${i === 0 ? "M" : "L"}${X(p.elapsed_seconds).toFixed(2)},${Y(p[key]).toFixed(2)}`).join(" ");
 
-  // 超温区间红色遮罩
+  // 核心温度曲线（叠加）：x 网格与箱温一致，按 elapsed 对齐
+  const corePath = coreCurve
+    ? coreCurve
+        .map((p, i) => `${i === 0 ? "M" : "L"}${X(p.elapsed_seconds).toFixed(2)},${Y(p.core_temp).toFixed(2)}`)
+        .join(" ")
+    : "";
+
+  // 箱温超温区间红色遮罩
   const hotRects = r.exceedance_intervals
     .map(
       (iv) =>
         `<rect x="${X(iv.elapsed_start_seconds)}" y="${MT}" width="${
           X(iv.elapsed_end_seconds) - X(iv.elapsed_start_seconds)
-        }" height="${ih}" fill="#ff5d5d" fill-opacity="0.16" />`
+        }" height="${ih}" fill="#ff5d5d" fill-opacity="0.12" />`
     )
     .join("");
+
+  // 核心超限区间紫色遮罩（叠加在箱温图上）
+  const coreRects = coreCurve
+    ? cb.exceedance_intervals
+        .map(
+          (iv) =>
+            `<rect x="${X(iv.elapsed_start_seconds)}" y="${MT}" width="${
+              X(iv.elapsed_end_seconds) - X(iv.elapsed_start_seconds)
+            }" height="${ih}" fill="#c78dff" fill-opacity="0.16" />`
+        )
+        .join("")
+    : "";
 
   const lid = lidRects
     .map(
@@ -303,14 +408,28 @@ function buildChart(r) {
       <text x="${X(ff.elapsed_seconds)}" y="${MT + 12}" fill="#ff5d5d" font-size="11" text-anchor="middle">最早失效 ${ff.time}</text>`
     : "";
 
-  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="箱温连续曲线">
-    ${lid}${hotRects}
+  const coreLimitLine = coreCurve
+    ? `<line x1="${ML}" y1="${Y(cb.core_temp_limit)}" x2="${W - MR}" y2="${Y(cb.core_temp_limit)}" stroke="#c78dff" stroke-width="1.4" stroke-dasharray="2 5"/>
+      <text x="${W - MR}" y="${Y(cb.core_temp_limit) + 14}" fill="#c78dff" font-size="11" text-anchor="end">核心温度上限 ${cb.core_temp_limit}℃</text>`
+    : "";
+
+  const rk = cb?.first_risk_time ?? null;
+  const riskLine = rk
+    ? `<line x1="${X(rk.elapsed_seconds)}" y1="${MT}" x2="${X(rk.elapsed_seconds)}" y2="${MT + ih}"
+        stroke="#c78dff" stroke-width="1.6" stroke-dasharray="6 4"/>
+      <text x="${X(rk.elapsed_seconds)}" y="${MT + 26}" fill="#c78dff" font-size="11" text-anchor="middle">最早风险 ${rk.time}</text>`
+    : "";
+
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="箱温与样品核心温度连续曲线">
+    ${lid}${hotRects}${coreRects}
     ${yTicks.join("")}${xTicks.join("")}
     <line x1="${ML}" y1="${Y(limit)}" x2="${W - MR}" y2="${Y(limit)}" stroke="#f5a623" stroke-width="1.6" stroke-dasharray="8 4"/>
     <text x="${W - MR}" y="${Y(limit) - 5}" fill="#f5a623" font-size="11" text-anchor="end">允许箱温 ${limit}℃</text>
     <path d="${path("ambient_temp")}" fill="none" stroke="#7d8fa1" stroke-width="1.6" stroke-dasharray="3 3"/>
     <path d="${path("box_temp")}" fill="none" stroke="#4da3ff" stroke-width="2.4"/>
-    ${dots}${ffLine}
+    ${coreCurve ? `<path d="${corePath}" fill="none" stroke="#c78dff" stroke-width="2.4"/>` : ""}
+    ${coreLimitLine}
+    ${dots}${ffLine}${riskLine}
     <line x1="${ML}" y1="${MT + ih}" x2="${W - MR}" y2="${MT + ih}" stroke="#93a4b5"/>
     <line x1="${ML}" y1="${MT}" x2="${ML}" y2="${MT + ih}" stroke="#93a4b5"/>
     <text x="${ML}" y="${H - 6}" fill="#93a4b5" font-size="11">经过时间（时:分:秒） →</text>
@@ -319,7 +438,10 @@ function buildChart(r) {
     <span class="swatch"><i style="background:#4da3ff"></i>箱温连续曲线（闭式解析解）</span>
     <span class="swatch"><i style="background:#7d8fa1"></i>环境温（段间线性）</span>
     <span class="swatch"><i style="background:#f5a623"></i>允许箱温</span>
-    <span class="swatch"><i style="background:var(--hot);border:1px solid #ff5d5d"></i>连续超温区间</span>
+    ${coreCurve ? `<span class="swatch"><i style="background:#c78dff"></i>样品核心温度（叠加）</span>
+    <span class="swatch"><i style="background:#c78dff;opacity:.5"></i>核心温度上限</span>
+    <span class="swatch"><i style="background:rgba(199,141,255,.25);border:1px solid #c78dff"></i>核心超限区间</span>` : ""}
+    <span class="swatch"><i style="background:var(--hot);border:1px solid #ff5d5d"></i>箱温连续超温区间</span>
     <span class="swatch"><i style="background:var(--lid);border:1px solid #f5a623"></i>箱盖开启时段</span>
     <span class="swatch">◦ 空心圆点为录入的箱温读数</span>
   </div>`;
@@ -369,22 +491,102 @@ function renderSegments(r) {
       .join("")}</tbody></table>`;
 }
 
+function renderCoreCard(r) {
+  const cb = r.core_temperature_review;
+  if (!cb) return "";
+  if (cb.status === "pass") {
+    return `<div class="core-card pass">
+      <h3>核心温度复核：未越限</h3>
+      <div class="kv">
+        首条记录时样品温度 <b>${fmtTemp(cb.sample_initial_temp)}℃</b>，
+        样品热惯性 τ样品 <b>${cb.tau_sample_seconds}s</b>，核心温度上限 <b>${fmtTemp(cb.core_temp_limit)}℃</b>。<br/>
+        全程核心温度区间 <b>${fmtTemp(cb.core_min_temp)}℃ ~ ${fmtTemp(cb.core_max_temp)}℃</b>，
+        末条记录时核心温度 <b>${fmtTemp(cb.sample_final_temp)}℃</b>，<b>未越过上限</b>，最早风险时刻：无。
+      </div></div>`;
+  }
+  const rk = cb.first_risk_time;
+  const iv = cb.exceedance_intervals[rk.interval_index];
+  return `<div class="core-card reject">
+    <h3>核心温度复核：核心超限（探头合格 ≠ 油样已降温）</h3>
+    <div class="kv">
+      样品热惯性 τ样品 <b>${cb.tau_sample_seconds}s</b>，核心温度上限 <b>${fmtTemp(cb.core_temp_limit)}℃</b>。<br/>
+      核心温度最早于 <b>${rk.time}</b>（距首条记录 ${fmtElapsed(rk.elapsed_seconds)}）
+      越过上限；全程核心最高 <b>${fmtTemp(cb.core_max_temp)}℃</b>。<br/>
+      首个核心超限区间：<b>${iv.start_time}</b> → <b>${iv.end_time}</b>
+      （持续 ${fmtDuration(iv.duration_seconds)}）。
+    </div></div>`;
+}
+
+function renderCoreIntervals(cb) {
+  if (!cb.exceedance_intervals.length)
+    return `<div class="hint">核心温度全程未超过上限。</div>`;
+  return `<table class="data">
+    <thead><tr><th>#</th><th>起始时刻</th><th>结束时刻</th><th class="num">持续时长(秒)</th></tr></thead>
+    <tbody>${cb.exceedance_intervals
+      .map(
+        (iv) => `<tr>
+        <td>${iv.index + 1}</td><td>${iv.start_time}</td><td>${iv.end_time}</td>
+        <td class="num">${fmtDuration(iv.duration_seconds)}（${iv.duration_seconds.toFixed(1)}s）</td>
+      </tr>`
+      )
+      .join("")}</tbody></table>`;
+}
+
+function renderCoreSegments(cb) {
+  return `<table class="data">
+    <thead><tr>
+      <th>#</th><th>段起→止(s)</th><th>箱盖</th>
+      <th class="num">τ箱/τ样品(秒)</th>
+      <th class="num">核心起℃</th><th class="num">核心止℃</th>
+      <th class="num">段内最高℃</th><th class="num">段内最低℃</th>
+      <th>核心穿越(相对秒)</th>
+    </tr></thead>
+    <tbody>${cb.segments
+      .map((s) => {
+        const cross = s.crossings
+          .map((c) => `<span class="${c.direction === "up" ? "core-up" : "core-down"}">${c.direction === "up" ? "↑上穿" : "↓下穿"}@${c.elapsed_seconds.toFixed(1)}</span>`)
+          .join("，");
+        const deg = s.degenerate_equal_tau ? ' <span class="tag open" title="样品热惯性等于箱体热惯性，采用极限闭式解">等τ</span>' : "";
+        return `<tr>
+        <td>${s.index + 1}</td>
+        <td>${s.elapsed_start_seconds} → ${s.elapsed_end_seconds}<br/><span class="hint" style="margin:0">${s.duration_seconds.toFixed(0)}s</span></td>
+        <td><span class="tag ${s.lid_open ? "open" : "closed"}">${s.lid_open ? "开启" : "关闭"}</span></td>
+        <td class="num">${s.tau_box_seconds} / ${s.tau_sample_seconds}${deg}</td>
+        <td class="num">${fmtTemp(s.core_temp_start)}</td>
+        <td class="num">${fmtTemp(s.core_temp_end)}</td>
+        <td class="num">${fmtTemp(s.max_temp.value)}<br/><span class="hint" style="margin:0">${s.max_temp.kind === "interior" ? "段内" + s.max_temp.elapsed_seconds.toFixed(0) + "s" : s.max_temp.kind === "start" ? "段起点" : "段终点"}</span></td>
+        <td class="num">${fmtTemp(s.min_temp.value)}</td>
+        <td>${cross || "—"}</td>
+      </tr>`;
+      })
+      .join("")}</tbody></table>`;
+}
+
 function renderResult(r) {
   if (!r) return "";
+  const cb = r.core_temperature_review;
   return `
   <div class="model-note">
     求解方式：<code>${r.model.equation}</code>；${r.model.ambient_assumption}；${r.model.solver}。<br/>
     每段以记录时刻实测箱温为初值锚定（段末模型值与下一读数偏差见审计数据），
     ${r.model.tau_switching}。${r.model.exceedance_rule}。
+    ${cb ? `<br/><b style="color:var(--core)">核心温度复核已启用</b>：${cb.model.equation}；${cb.model.driver}；${cb.model.initial_condition}` : ""}
   </div>
   ${renderFailureCard(r)}
+  ${renderCoreCard(r)}
   <div class="chart-wrap">${buildChart(r)}</div>
 
-  <div class="section-title">累计连续超温区间（跨记录取并集）</div>
+  <div class="section-title">箱体连续超温区间（跨记录取并集）</div>
   ${renderIntervals(r)}
 
-  <div class="section-title">各段解析极值与阈值穿越</div>
-  ${renderSegments(r)}`;
+  <div class="section-title">各段箱温解析极值与阈值穿越</div>
+  ${renderSegments(r)}
+
+  ${cb ? `<div class="section-title core-title">核心温度连续超限区间（首个上穿即最早风险时刻）</div>
+  ${renderCoreIntervals(cb)}
+
+  <div class="section-title core-title">各段核心温度起止状态、解析极值与阈值穿越</div>
+  ${renderCoreSegments(cb)}` : ""}`;
 }
 
 function render() {
@@ -405,21 +607,26 @@ function render() {
 
 function bind() {
   document.getElementById("submit")?.addEventListener("click", submitAudit);
+  document.getElementById("core_enabled")?.addEventListener("change", () => {
+    const { recs, params, coreReview } = collectInputs();
+    state.records = recs; state.parameters = params; state.coreReview = coreReview;
+    render();
+  });
   document.getElementById("addRow")?.addEventListener("click", () => {
-    const { recs, params } = collectInputs();
+    const { recs, params, coreReview } = collectInputs();
     if (recs.length >= 30) return;
     const last = recs[recs.length - 1];
     recs.push({
       time: typeof last.time === "number" ? last.time + 600 : last.time,
       box_temp: last.box_temp, ambient_temp: last.ambient_temp, lid_open: false,
     });
-    state.records = recs; state.parameters = params; render();
+    state.records = recs; state.parameters = params; state.coreReview = coreReview; render();
   });
   document.querySelectorAll("[data-del]").forEach((b) =>
     b.addEventListener("click", () => {
-      const { recs, params } = collectInputs();
+      const { recs, params, coreReview } = collectInputs();
       recs.splice(Number(b.dataset.del), 1);
-      state.records = recs; state.parameters = params; render();
+      state.records = recs; state.parameters = params; state.coreReview = coreReview; render();
     })
   );
   document.querySelectorAll("[data-preset]").forEach((b) => {
@@ -427,6 +634,9 @@ function bind() {
       const pre = PRESETS[b.dataset.preset];
       state.records = structuredClone(pre.records);
       state.parameters = { ...pre.parameters };
+      state.coreReview = pre.coreReview
+        ? structuredClone(pre.coreReview)
+        : { ...state.coreReview, enabled: false };
       state.result = null; state.error = null; render();
     });
   });

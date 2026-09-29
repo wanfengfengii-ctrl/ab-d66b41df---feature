@@ -1,7 +1,9 @@
 """温控审计 API 冒烟脚本（verify 服务内运行）。
 
 校验：健康检查、参数约定接口、拒收裁决（含连续超温区间证据与最早失效时刻）、
-数据不合法 (422)。任何断言失败即以非零退出码结束容器。
+放行裁决、数据不合法 (422)，以及【核心温度复核】启用 / 未启用两类审计：
+未启用响应保持原样；启用后区分箱体放行但核心拒收，并对非法/无穷参数给出
+字段级错误。任何断言失败即以非零退出码结束容器。
 """
 from __future__ import annotations
 
@@ -43,6 +45,35 @@ PASS_PAYLOAD = {
     },
 }
 
+# 箱体探头全程合格（箱温 < 8℃，箱体裁决放行），但样品核心温度滞后冲高、
+# 核心上限设为 6℃ → 启用复核后必须判“箱体放行但核心拒收”。
+CORE_REJECT_RECORDS = [
+    {"time": t, "box_temp": 7.5 - 3.5 * (2.718281828459045 ** (-t / 300.0)),
+     "ambient_temp": 7.5, "lid_open": False}
+    for t in (0, 600, 1200, 1800, 2400)
+]
+CORE_REJECT_PAYLOAD = {
+    "records": CORE_REJECT_RECORDS,
+    "parameters": {
+        "tau_closed": 300,
+        "tau_open": 90,
+        "box_temp_limit": 8.0,
+        "exposure_limit_seconds": 600,
+    },
+    "core_temperature_review": {
+        "enabled": True,
+        "sample_initial_temp": 4.0,
+        "tau_sample_seconds": 900.0,
+        "core_temp_limit": 6.0,
+    },
+}
+# 未启用复核：显式 enabled=false，响应须与不含该字段完全一致
+CORE_DISABLED_PAYLOAD = {
+    "records": CORE_REJECT_RECORDS,
+    "parameters": CORE_REJECT_PAYLOAD["parameters"],
+    "core_temperature_review": {"enabled": False},
+}
+
 
 def check(cond: bool, msg: str) -> None:
     if not cond:
@@ -82,6 +113,52 @@ def main() -> None:
         body = r.json()
         check(r.status_code == 200 and body["status"] == "pass", "放行场景裁决为 pass/放行")
         check(body["first_failure_time"] is None, "放行场景无失效时刻")
+
+        # ---- 核心温度复核：未启用 ----
+        plain = c.post(
+            "/api/audit",
+            json={"records": CORE_REJECT_RECORDS, "parameters": CORE_REJECT_PAYLOAD["parameters"]},
+        ).json()
+        check("core_temperature_review" not in plain, "未启用复核时响应不含 core_temperature_review")
+        r = c.post("/api/audit", json=CORE_DISABLED_PAYLOAD)
+        check(r.status_code == 200 and r.json() == plain, "显式 enabled=false 与未启用响应完全一致")
+
+        # ---- 核心温度复核：启用（箱体放行但核心拒收）----
+        r = c.post("/api/audit", json=CORE_REJECT_PAYLOAD)
+        check(r.status_code == 200, f"启用复核 HTTP 200（实际 {r.status_code}）")
+        body = r.json()
+        check(body["box_status"] == "pass", "箱体探头裁决为放行")
+        check(body["status"] == "reject", "启用复核后总体裁决为拒收")
+        cb = body.get("core_temperature_review")
+        check(isinstance(cb, dict) and cb.get("enabled") is True, "返回核心温度复核证据块")
+        check(cb["status"] == "reject", "核心温度裁决为 reject（核心超限）")
+        risk = cb.get("first_risk_time")
+        check(isinstance(risk, dict) and risk.get("elapsed_seconds") is not None, "给出最早风险时刻")
+        check(cb["exceedance_intervals"] and cb["exceedance_intervals"][0]["duration_seconds"] > 0,
+              "给出核心温度连续超限区间")
+        check(len(cb["segments"]) == len(CORE_REJECT_RECORDS) - 1, "逐段返回核心复核证据")
+        seg = cb["segments"][0]
+        check(
+            abs(seg["core_temp_end"] - cb["segments"][1]["core_temp_start"]) < 1e-9,
+            "样品核心温度跨记录连续传递（段末=下段起点，不重新锚定）",
+        )
+        check({"core_temp", "box_temp"} <= set(cb["curve"][0]), "核心曲线采样同时含核心温度与驱动箱温")
+
+        # ---- 核心温度复核：非法/无穷参数字段级错误 ----
+        raw = (
+            '{"records": ' + __import__("json").dumps(CORE_REJECT_RECORDS)
+            + ', "parameters": ' + __import__("json").dumps(CORE_REJECT_PAYLOAD["parameters"])
+            + ', "core_temperature_review": {"enabled": true, "sample_initial_temp": 4.0,'
+            ' "tau_sample_seconds": Infinity, "core_temp_limit": 6.0}}'
+        )
+        r = c.post("/api/audit", content=raw, headers={"content-type": "application/json"})
+        check(r.status_code == 422, "无穷复核参数判为 422")
+        err = r.json()["errors"][0]
+        check(
+            err["code"] == "bad_core_review"
+            and err["field"] == "core_temperature_review.tau_sample_seconds",
+            "无穷参数给出字段级错误（tau_sample_seconds）",
+        )
 
         r = c.post("/api/audit", json={"records": [], "parameters": {}})
         check(r.status_code == 422 and r.json()["status"] == "invalid", "空记录判为数据不合法 (422)")
