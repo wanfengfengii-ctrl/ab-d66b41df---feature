@@ -17,7 +17,7 @@ npm run build
 test -f dist/index.html
 echo "frontend build: OK"
 
-echo "================ [3/3] 温控审计 API 冒烟 ================"
+echo "================ [3/3] 温控审计 API 冒烟（含核心复核启用/未启用两类） ================"
 cd /app
 APP_PORT="$APP_PORT" AUDIT_BASE_URL="$AUDIT_BASE_URL" python scripts/smoke.py
 echo "smoke: OK"

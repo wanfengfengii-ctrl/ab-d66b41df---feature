@@ -77,3 +77,57 @@ def make_records_from_sim(times, ambients, lid, t0_box, tau_closed, tau_open):
             }
         )
     return raw
+
+
+def rk4_core_simulate(records, tau_closed, tau_open, tau_sample, c0, dt=0.05):
+    """独立 RK4 积分样品核心温度 dC/dt=(T_box(t)-C)/tau_sample。
+
+    驱动 T_box 为**逐段闭式箱温曲线**（与生产引擎同一给定输入，非被核验对象），
+    核心状态仅以首条记录处 c0 锚定一次，随后跨记录连续推进。
+    返回逐 dt 的 (t, C)。
+    """
+    import math
+
+    def box_closed(s, t_i, a, b, tau_b):
+        return a + b * (s - tau_b) + (t_i - a + b * tau_b) * math.exp(-s / tau_b)
+
+    out = []
+    C = float(c0)
+    t = float(records[0]["time"])
+    out.append((t, C))
+    for i in range(len(records) - 1):
+        r0, r1 = records[i], records[i + 1]
+        t_start = float(r0["time"])
+        dur = float(r1["time"]) - t_start
+        a = float(r0["ambient_temp"])
+        b = (float(r1["ambient_temp"]) - a) / dur
+        tau_b = float(tau_open if r0["lid_open"] else tau_closed)
+        box_i = float(r0["box_temp"])
+
+        def env_box(tt):
+            return box_closed(tt - t_start, box_i, a, b, tau_b)
+
+        n = int(math.floor(dur / dt))
+        for k in range(n):
+            h = min(dt, dur - k * dt)
+
+            def step(val, hh):
+                k1 = (env_box(t) - val) / tau_sample
+                k2 = (env_box(t + hh / 2) - (val + hh * k1 / 2)) / tau_sample
+                k3 = (env_box(t + hh / 2) - (val + hh * k2 / 2)) / tau_sample
+                k4 = (env_box(t + hh) - (val + hh * k3)) / tau_sample
+                return val + hh * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+
+            C = step(C, h)
+            t += h
+            out.append((t, C))
+        if t < float(r1["time"]) - 1e-9:
+            h = float(r1["time"]) - t
+            k1 = (env_box(t) - C) / tau_sample
+            k2 = (env_box(t + h / 2) - (C + h * k1 / 2)) / tau_sample
+            k3 = (env_box(t + h / 2) - (C + h * k2 / 2)) / tau_sample
+            k4 = (env_box(t + h) - (C + h * k3)) / tau_sample
+            C = C + h * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+            t = float(r1["time"])
+            out.append((t, C))
+    return out

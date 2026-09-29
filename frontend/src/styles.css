@@ -142,6 +142,21 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
 .up { color: var(--reject); }
 .down { color: var(--pass); }
 
+.mini-tag {
+  display: inline-block; padding: 2px 10px; border-radius: 20px;
+  font-size: 12px; margin: 6px 8px 0 0; font-weight: 600;
+}
+.mini-tag.pass { background: rgba(52, 211, 153, 0.18); color: var(--pass); border: 1px solid rgba(52,211,153,0.4); }
+.mini-tag.reject { background: rgba(185, 140, 255, 0.20); color: #c9a6ff; border: 1px solid rgba(185,140,255,0.5); }
+.mini-tag.reject-box { background: rgba(255,93,93,0.18); color: var(--reject); border: 1px solid rgba(255,93,93,0.45); }
+.check-field { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0 6px; }
+.check-field input { width: auto; margin-top: 3px; }
+
+.failure-card.core { border-color: #b98cff; background: rgba(185, 140, 255, 0.10); }
+.failure-card.core h3 { color: #c9a6ff; }
+.failure-card.core-ok { border-color: var(--pass); background: rgba(52, 211, 153, 0.08); }
+.failure-card.core-ok h3 { color: var(--pass); }
+
 .error-box {
   background: rgba(245, 166, 35, 0.08); border: 1px solid var(--invalid);
   border-radius: 8px; padding: 12px 14px; margin-top: 10px;

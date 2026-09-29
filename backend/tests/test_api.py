@@ -121,3 +121,92 @@ def test_iso_time_payload():
     r = client.post("/api/audit", json={"records": recs, "parameters": PARAMS})
     assert r.status_code == 200
     assert isinstance(r.json()["records_echo"][0]["time"], str)
+
+
+# ---------- 核心温度复核：启用 / 未启用两类审计 ----------
+
+def test_core_review_disabled_is_original_response():
+    times = [0, 60, 1560, 2460, 3360]
+    ambs = [25.0, 25.0, 3.0, 3.0, 3.0]
+    recs = make_records_from_sim(times, ambs, [False] * 5, 4.0, 300.0, 90.0)
+    r = client.post("/api/audit", json={"records": recs, "parameters": PARAMS})
+    assert r.status_code == 200
+    body = r.json()
+    assert "core_review" not in body
+    assert "final_status" not in body
+    assert "core_temp" not in body["curve"][0]
+
+
+def test_core_review_enabled_returns_core_evidence():
+    times = [0, 60, 1560, 2460, 3360]
+    ambs = [25.0, 25.0, 3.0, 3.0, 3.0]
+    recs = make_records_from_sim(times, ambs, [False] * 5, 4.0, 300.0, 90.0)
+    payload = {
+        "records": recs,
+        "parameters": PARAMS,
+        "core_review": {
+            "enabled": True,
+            "sample_initial_temp": 4.0,
+            "tau_sample_seconds": 900.0,
+            "core_temp_limit": 8.0,
+        },
+    }
+    r = client.post("/api/audit", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    cr = body["core_review"]
+    assert cr["enabled"] is True
+    assert cr["status"] == "reject"
+    assert cr["verdict"] == "核心拒收"
+    assert cr["first_risk_time"] is not None
+    assert body["final_status"] == "reject"
+    assert len(cr["segments"]) == len(recs) - 1
+    assert all("core_temp" in p for p in body["curve"])
+    # 段间核心温度连续传递
+    for prev, nxt in zip(cr["segments"], cr["segments"][1:]):
+        assert abs(prev["core_temp_end"] - nxt["core_temp_start"]) < 1e-9
+
+
+def test_core_review_box_pass_core_reject_distinguished():
+    times = [0, 600, 1200, 1800]
+    ambs = [4.0, 25.0, 25.0, 4.0]
+    recs = make_records_from_sim(times, ambs, [False] * 4, 4.0, 300.0, 90.0)
+    params = {**PARAMS, "exposure_limit_seconds": 3600}
+    payload = {
+        "records": recs,
+        "parameters": params,
+        "core_review": {
+            "enabled": True,
+            "sample_initial_temp": 4.0,
+            "tau_sample_seconds": 300.0,
+            "core_temp_limit": 7.0,
+        },
+    }
+    r = client.post("/api/audit", json=payload)
+    body = r.json()
+    assert r.status_code == 200
+    assert body["box_status"] == "pass"
+    assert body["core_review"]["status"] == "reject"
+    assert body["final_status"] == "reject"
+    assert "箱体放行但核心拒收" in body["final_verdict"]
+
+
+def test_core_review_invalid_param_is_field_level_422():
+    recs = [
+        {"time": i, "box_temp": 4.0, "ambient_temp": 5.0, "lid_open": False}
+        for i in range(4)
+    ]
+    payload = {
+        "records": recs,
+        "parameters": PARAMS,
+        "core_review": {
+            "enabled": True,
+            "sample_initial_temp": 4.0,
+            "tau_sample_seconds": 0,
+            "core_temp_limit": 8.0,
+        },
+    }
+    r = client.post("/api/audit", json=payload)
+    assert r.status_code == 422
+    err = r.json()["errors"][0]
+    assert err["field"] == "core_review.tau_sample_seconds"

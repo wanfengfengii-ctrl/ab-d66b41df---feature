@@ -34,6 +34,15 @@ def audit_schema() -> dict[str, object]:
             "box_temp_limit": "允许箱温阈值（数值，严格超限 T>limit 计暴露）",
             "exposure_limit_seconds": "允许连续暴露时长（秒，>0）",
         },
+        "core_review": {
+            "_": "可选；缺省或 enabled=false 时原请求、结论与证据保持不变",
+            "enabled": "是否启用核心温度复核（布尔）",
+            "sample_initial_temp": "首条记录时刻的样品温度（有限数值，仅此一处锚定样品状态）",
+            "tau_sample_seconds": "样品对箱温的热惯性时间常数（秒，>0；允许等于箱体热惯性）",
+            "core_temp_limit": "核心温度上限（有限数值，严格超限即核心拒收）",
+            "solver": "启用后以逐段箱温闭式曲线为样品一阶响应的连续驱动，跨记录传递核心温度，"
+            "不在每条记录处重新锚定，也不按展示采样点裁决",
+        },
     }
 
 
